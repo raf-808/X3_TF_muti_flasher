@@ -58,6 +58,19 @@ class FakeRaw:
         pass
 
 
+class AlignedRaw(FakeRaw):
+    """模拟真实物理盘：ReadFile 长度必须是扇区整数倍（否则 ERROR_INVALID_PARAMETER）。"""
+
+    def __init__(self, sector):
+        super().__init__()
+        self.sector = sector
+
+    def read(self, size: int) -> bytes:
+        if size % self.sector:
+            raise OSError(f"ReadFile err=87（非扇区对齐读取 {size}B）")
+        return super().read(size)
+
+
 class TailAccountingTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -66,7 +79,8 @@ class TailAccountingTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, raw, sector=512, verify=True, meta_sha=None, fake=None):
+    def _run(self, raw, sector=512, verify=True, meta_sha=None, fake=None,
+             offline=False):
         img = self.dir / "x.img"
         img.write_bytes(raw)
         fake = fake or FakeRaw()
@@ -79,6 +93,7 @@ class TailAccountingTest(unittest.TestCase):
         q: queue.Queue = queue.Queue()
         with mock.patch.object(t, "lock_target_volumes", return_value=[]), \
              mock.patch.object(t, "_open", return_value=1), \
+             mock.patch.object(t, "_set_disk_offline", return_value=offline), \
              mock.patch.object(t, "_RawDiskFile", lambda h: fake):
             res = t.flash_one(target, str(img), verify, threading.Event(), q, meta_box)
         return res, fake, list(q.queue)
@@ -114,7 +129,15 @@ class TailAccountingTest(unittest.TestCase):
         raw = b"\x5a" * 4097
         res, fake, _msgs = self._run(raw, sector=4096, verify=True)
         self.assertTrue(res["ok"], res.get("error"))
-        self.assertEqual(fake.bytes_read, 4097)
+        self.assertEqual(fake.bytes_read, 8192)  # 对齐读 4096+4096，仅前 4097 计入哈希
+
+    def test_aligned_device_reads_succeed_for_unaligned_image(self):
+        raw = b"\x5a" * 4097
+        fake = AlignedRaw(512)
+        res, _fake, _msgs = self._run(raw, sector=512, verify=True, fake=fake)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertEqual(res["bytes"], 4097)
+        self.assertEqual(res["written_bytes"], 4608)
 
     def test_verify_off_does_not_read_back(self):
         raw = b"\x5a" * 4097
@@ -149,6 +172,11 @@ class TailAccountingTest(unittest.TestCase):
         for _kind, _idx, done, total, _speed in prog:
             self.assertEqual(total, len(raw))
             self.assertLessEqual(done, len(raw))
+
+    def test_disk_offline_is_recorded(self):
+        res, _fake, _msgs = self._run(b"\x5a" * 4097, offline=True)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertTrue(res["disk_offline"])
 
     def test_cancel_before_write_reports_zero(self):
         raw = b"\x5a" * 4097

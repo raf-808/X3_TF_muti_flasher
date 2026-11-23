@@ -48,6 +48,11 @@ def build_image(mib: int = 16, tail: int = 0) -> dict:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # 避免非 UTF-8 控制台/重定向下打印 ✔ 崩溃
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     argv = sys.argv[1:]
     tail = 1 if "--tail" in argv else 0
     nums = [a for a in argv if a.isdigit()]

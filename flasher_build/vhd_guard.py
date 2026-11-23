@@ -3,9 +3,9 @@
 
 背景：flasher_build 下的 E2E 脚本会真实调用 flash_one 写 \\\\.\\PhysicalDriveN。
 仅凭「bus=15 且容量小」无法证明该盘就是本项目创建的 VHD；一旦误传真实盘号，
-可能擦掉 U 盘/移动硬盘。本模块以「登记 VHD 路径 → Get-DiskImage 只读关联 →
-磁盘号」作为唯一身份来源：只有映射到登记 VHD 的物理盘才放行，任何查询失败
-一律拒绝（fail closed）。
+可能擦掉 U 盘/移动硬盘。本模块以「登记 VHD 路径 → Get-DiskImage DevicePath
+只读关联 → 磁盘号」作为唯一身份来源：只有映射到登记 VHD 的物理盘才放行，
+任何查询失败一律拒绝（fail closed）。DevicePath 解析不需要管理员权限。
 
 登记来源：mk_vhd_script.py / mk_vhd_more.py 在 %TEMP% 下创建
 x3wtest.vhd / x3wtest2.vhd / x3wtest3.vhd。这里沿用同一命名规则；
@@ -51,8 +51,12 @@ def _query_script(paths: list[Path]) -> str:
         lines.append("  try {")
         lines.append("    $img = Get-DiskImage -ImagePath $p -ErrorAction Stop")
         lines.append("    if ($img.Attached) {")
-        lines.append("      $n = ($img | Get-Disk -ErrorAction Stop).Number")
-        lines.append('      Write-Output ("OK`t" + $p + "`t" + $n)')
+        lines.append("      $dp = [string]$img.DevicePath")
+        lines.append("      if ($dp -match 'PhysicalDrive(\\d+)$') {")
+        lines.append('        Write-Output ("OK`t" + $p + "`t" + $matches[1])')
+        lines.append("      } else {")
+        lines.append('        Write-Output ("ERR`t" + $p + "`t无法解析设备路径: " + $dp)')
+        lines.append("      }")
         lines.append("    }")
         lines.append("  } catch {")
         lines.append('    Write-Output ("ERR`t" + $p + "`t" + $_.Exception.Message)')

@@ -132,6 +132,27 @@ class LockTargetVolumesTest(unittest.TestCase):
         k.CloseHandle.assert_not_called()
 
 
+class DiskOfflineTest(unittest.TestCase):
+    def test_offline_and_online_attributes(self):
+        seen = []
+
+        def fake_ioctl(h, code, inbuf=None, outbuf=None):
+            seen.append((code, inbuf.Attributes, inbuf.AttributesMask))
+            return True
+
+        with mock.patch.object(t, "_ioctl", side_effect=fake_ioctl):
+            self.assertTrue(t._set_disk_offline(1, True))
+            self.assertTrue(t._set_disk_offline(1, False))
+        self.assertEqual(seen[0][0], t.IOCTL_DISK_SET_DISK_ATTRIBUTES)
+        self.assertEqual(seen[0][1], t.DISK_ATTRIBUTE_OFFLINE)
+        self.assertEqual(seen[0][2], t.DISK_ATTRIBUTE_OFFLINE)
+        self.assertEqual(seen[1][1], 0)
+
+    def test_offline_failure_returns_false(self):
+        with mock.patch.object(t, "_ioctl", return_value=False):
+            self.assertFalse(t._set_disk_offline(1, True))
+
+
 class FlashOneLockGateTest(unittest.TestCase):
     def test_lock_failure_never_opens_physicaldrive(self):
         target = {"index": 7, "model": "m", "serial": "", "size": 64 << 20,

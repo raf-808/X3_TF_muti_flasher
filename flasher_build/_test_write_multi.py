@@ -17,6 +17,11 @@ from _test_write_e2e import build_image  # noqa: E402
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # 非 UTF-8 控制台/重定向时避免打印异常
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     disks, _ = t.enumerate_disks()
     try:
         targets = vhd_guard.select_test_disks(disks)

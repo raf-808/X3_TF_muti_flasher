@@ -127,7 +127,10 @@ FSCTL_DISMOUNT_VOLUME = 0x00090020
 IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_SET_DISK_ATTRIBUTES = 0x0007C0F4
 IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+
+DISK_ATTRIBUTE_OFFLINE = 0x1
 
 ERROR_INVALID_FUNCTION = 1
 ERROR_NO_MORE_FILES = 18
@@ -184,6 +187,16 @@ class VOLUME_DISK_EXTENTS(ctypes.Structure):
     _fields_ = [
         ("NumberOfDiskExtents", wintypes.DWORD),
         ("Extents", DISK_EXTENT * MAX_VOLUME_EXTENTS),
+    ]
+
+
+class SET_DISK_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Version", ctypes.c_ulonglong),
+        ("Persist", wintypes.BOOLEAN),
+        ("Reserved1", wintypes.BYTE * 3),
+        ("Attributes", ctypes.c_ulonglong),
+        ("AttributesMask", ctypes.c_ulonglong),
     ]
 
 
@@ -525,6 +538,20 @@ def lock_target_volumes(disk_index: int, volumes: list[dict] | None = None) -> l
         raise
 
 
+def _set_disk_offline(h: int, offline: bool) -> bool:
+    """best-effort 将物理盘置离线/恢复在线。
+
+    锁定+弹出卷后，Windows 仍可能拒绝写入与已挂载卷 extent 重叠的区间
+    （实测固定 VHD+NTFS 会 WriteFile err=5）。离线磁盘可解除该限制；
+    该操作失败不改变“锁/弹出失败即拒写”的契约，仅影响能否写入。"""
+    attrs = SET_DISK_ATTRIBUTES()
+    attrs.Version = ctypes.sizeof(SET_DISK_ATTRIBUTES)
+    attrs.Persist = False
+    attrs.Attributes = DISK_ATTRIBUTE_OFFLINE if offline else 0
+    attrs.AttributesMask = DISK_ATTRIBUTE_OFFLINE
+    return _ioctl(h, IOCTL_DISK_SET_DISK_ATTRIBUTES, attrs, None)
+
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -843,11 +870,12 @@ def flash_one(target: dict, img_path: str, verify: bool,
         "drive": idx, "model": target["model"], "serial": target.get("serial", ""),
         "size": target["size"], "letters": target.get("letters", []),
         "bytes": 0, "written_bytes": 0, "ok": False, "cancelled": False,
-        "error": None, "warns": [],
+        "error": None, "warns": [], "disk_offline": False,
         "verify_requested": bool(verify), "verify_completed": False,
     }
     f = None
     held = []
+    offlined = False
     logical_n = 0   # 逻辑镜像字节（对账与结果 bytes）
     written_n = 0   # 实际写入设备字节（含尾部补零）
     t0 = time.time()
@@ -863,6 +891,9 @@ def flash_one(target: dict, img_path: str, verify: bool,
             raise OSError(f"打开 \\\\.\\PhysicalDrive{idx} 失败 err={err}"
                           + ("（需要管理员权限）" if err == 5 else ""))
         f = _RawDiskFile(h)
+        # 卷已锁定/弹出；再 best-effort 离线磁盘，解除 Windows 对卷 extent 的写保护
+        offlined = _set_disk_offline(h, True)
+        res["disk_offline"] = offlined
 
         sector = target.get("sector") or 512
         sha = hashlib.sha256()
@@ -924,17 +955,23 @@ def flash_one(target: dict, img_path: str, verify: bool,
             while m < logical_n:  # 只读回原始镜像区间，不校验尾部补零
                 if stop.is_set():
                     raise Cancelled()
-                d = f.read(min(CHUNK, logical_n - m))
+                want = min(CHUNK, logical_n - m)
+                # 物理盘 ReadFile 要求长度为扇区整数倍；多读的补零字节丢弃
+                aligned = (want + sector - 1) // sector * sector
+                d = f.read(aligned)
                 if not d:
                     raise OSError(f"读回提前到 EOF（offset {m}）——卡可能已掉线")
-                vsha.update(d)
-                m += len(d)
+                use = d[:want]
+                vsha.update(use)
+                m += len(use)
                 speed = m / max(time.time() - t0, 1e-6) / 1e6
                 q.put(("prog", idx, m, logical_n, speed))
             if vsha.hexdigest() != meta["img_sha256"]:
                 raise OSError("读回校验 sha256 不匹配——卡可能损坏或为扩容假卡，请换卡重试")
             res["verify_completed"] = True
 
+        if offlined and not _set_disk_offline(h, False):
+            res["warns"].append("磁盘恢复在线失败，可能需要重新插拔")
         f.close()
         f = None
         res.update(ok=True, bytes=logical_n, written_bytes=written_n,
@@ -948,6 +985,8 @@ def flash_one(target: dict, img_path: str, verify: bool,
         res.update(error=str(e), secs=time.time() - t0)
     finally:
         if f is not None:
+            if offlined and not _set_disk_offline(f.h, False):
+                res["warns"].append("磁盘恢复在线失败，可能需要重新插拔")
             try:
                 f.close()
             except Exception:

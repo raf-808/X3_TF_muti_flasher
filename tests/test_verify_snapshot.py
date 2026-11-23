@@ -55,6 +55,7 @@ class FlashOneVerifyFieldsTest(unittest.TestCase):
                   "letters": [], "sector": 512}
         with mock.patch.object(t, "lock_target_volumes", return_value=[]), \
              mock.patch.object(t, "_open", return_value=1), \
+             mock.patch.object(t, "_set_disk_offline", return_value=False), \
              mock.patch.object(t, "_RawDiskFile", lambda h: FakeRaw(corrupt=corrupt)):
             return t.flash_one(target, str(img), verify, threading.Event(),
                                queue.Queue(), meta_box)

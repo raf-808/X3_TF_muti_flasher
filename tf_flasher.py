@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from ctypes import wintypes
 from pathlib import Path
 
@@ -58,6 +59,7 @@ else:
 CACHE_DIR = SCRIPT_DIR / "flash_cache"   # 镜像预扫描结果缓存（按压缩包 sha256 内容寻址）
 LOG_DIR = SCRIPT_DIR / "flash_logs"      # 每次写入运行的 JSON 台账
 CHUNK = 8 << 20                          # 8 MiB 流式块（扇区对齐的整数倍）
+HEADER_BYTES = 2 << 20                   # 预检读取的镜像头部（覆盖 512B/4K 扇区 GPT 元数据）
 MAX_TARGET_BYTES = 64 << 30              # 超过 64 GiB 的磁盘一律不枚举为写卡目标（防误选大硬盘）
 
 try:
@@ -75,6 +77,10 @@ class Cancelled(Exception):
 
 class VolumeSafetyError(RuntimeError):
     """卷枚举/锁定/弹出不可靠——目标盘必须拒写（不得写入任何字节）。"""
+
+
+class ImageValidationError(ValueError):
+    """输入不是可写入的完整磁盘镜像（MBR/GPT 结构或 gzip 完整性不合法）。"""
 
 
 # ----------------------------------------------------------------------------
@@ -101,6 +107,12 @@ kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
 kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
     wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
 ]
+kernel32.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+kernel32.GetVolumeNameForVolumeMountPointW.argtypes = [
+    wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+]
+kernel32.GetDriveTypeW.restype = wintypes.UINT
+kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -121,6 +133,7 @@ ERROR_INVALID_FUNCTION = 1
 ERROR_NO_MORE_FILES = 18
 ERROR_NOT_SUPPORTED = 50
 ERROR_MORE_DATA = 234
+DRIVE_REMOTE = 4
 
 BUS_NAMES = {
     0: "未知", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394", 6: "FC", 7: "USB",
@@ -403,6 +416,80 @@ def selectable(d: dict) -> bool:
     )
 
 
+def _existing_ancestor(p: Path) -> Path:
+    while not p.exists():
+        if p.parent == p:
+            break
+        p = p.parent
+    return p
+
+
+def _volume_name_for_path(path: str) -> str | None:
+    """本地路径 → 所在卷 GUID 名称；UNC/网络映射盘返回 None（不属于本地物理盘）。
+
+    映射失败抛 VolumeSafetyError——调用方必须拒绝写盘，不能默认可写。"""
+    raw = os.path.abspath(os.fspath(path))
+    if raw.startswith("\\\\"):
+        return None
+    drive = os.path.splitdrive(raw)[0]
+    if drive and kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE:
+        return None
+    probe = _existing_ancestor(Path(raw))
+    root = ctypes.create_unicode_buffer(261)
+    if not kernel32.GetVolumePathNameW(str(probe), root, len(root)):
+        raise VolumeSafetyError(
+            f"无法解析 {path} 所在卷 err={ctypes.get_last_error()}")
+    vol = ctypes.create_unicode_buffer(261)
+    if not kernel32.GetVolumeNameForVolumeMountPointW(root.value, vol, len(vol)):
+        raise VolumeSafetyError(
+            f"无法解析 {path} 所在卷 GUID err={ctypes.get_last_error()}")
+    return vol.value
+
+
+def source_disks(paths: list[str], disks: list[dict]) -> set[int]:
+    """返回镜像/工具路径所在的本地物理盘号集合（网络路径忽略）。
+
+    disks 必须来自同一轮 enumerate_disks()。任何路径映射失败、卷拓扑不可靠或
+    卷找不到归属盘，都抛 VolumeSafetyError——宁可拒写，不默认可写。"""
+    names = {name for name in (_volume_name_for_path(p) for p in paths) if name}
+    if not names:
+        return set()
+    wanted = {n.upper() for n in names}
+    if any(not d.get("volume_known", False) for d in disks):
+        raise VolumeSafetyError("存在卷拓扑不可靠的磁盘，无法排除源盘")
+    known = {v["name"].upper() for d in disks for v in d.get("volumes", [])}
+    missing = wanted - known
+    if missing:
+        raise VolumeSafetyError(f"无法在卷列表中定位: {', '.join(sorted(missing))}")
+    return {
+        d["index"] for d in disks
+        if any(v["name"].upper() in wanted for v in d.get("volumes", []))
+    }
+
+
+def partition_targets(disks: list[dict], picked: list[int], forbidden: set[int],
+                      img_size: int | None = None) -> tuple[list[dict], list[str]]:
+    """GUI/CLI 共用的最终写盘准入：通过返回 targets，否则给出拒绝原因。"""
+    by_idx = {d["index"]: d for d in disks}
+    targets, rejects = [], []
+    for i in picked:
+        d = by_idx.get(i)
+        if d is None:
+            rejects.append(f"PhysicalDrive{i}: 已不在位（可能被拔出）")
+        elif i in forbidden:
+            rejects.append(f"PhysicalDrive{i}: 镜像或工具所在物理盘，禁止写入")
+        elif not selectable(d):
+            rejects.append(f"PhysicalDrive{i}: 不满足可写条件"
+                           f"（非可移除/系统盘/卷枚举不可靠/超 "
+                           f"{_fmt_size(MAX_TARGET_BYTES)} 上限）")
+        elif img_size and d["size"] < img_size:
+            rejects.append(f"PhysicalDrive{i}: 容量 {_fmt_size(d['size'])} < 镜像 "
+                           f"{_fmt_size(img_size)}，装不下")
+        else:
+            targets.append(d)
+    return targets, rejects
+
+
 def lock_target_volumes(disk_index: int, volumes: list[dict] | None = None) -> list[int]:
     """锁定并弹出目标盘关联的全部卷；任何失败抛 VolumeSafetyError 并释放全部句柄。
 
@@ -482,8 +569,121 @@ def sha256_file(path: Path, progress=None, cancel=None) -> tuple[str, int]:
     return h.hexdigest(), total
 
 
+def _crc32(data: bytes) -> int:
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def _read_head(path: Path, is_gz: bool) -> bytes:
+    """读取镜像头部（用于结构校验）；gzip 只解压头部，不校验全文 CRC。"""
+    try:
+        if is_gz:
+            with gzip.open(path, "rb") as f:
+                return f.read(HEADER_BYTES)
+        with open(path, "rb") as f:
+            return f.read(HEADER_BYTES)
+    except (gzip.BadGzipFile, EOFError) as e:
+        raise ImageValidationError(f"gzip 镜像损坏或截断: {e}") from e
+
+
+def _parse_mbr(head: bytes, img_size: int) -> tuple[list[tuple[int, int, int]], bool]:
+    """解析 MBR 分区项；返回 (普通分区列表, 是否含 0xEE 保护项)。"""
+    entries, protective = [], False
+    for i in range(4):
+        e = head[446 + i * 16: 462 + i * 16]
+        if len(e) < 16:
+            raise ImageValidationError("镜像头部不足 512 字节，无法解析 MBR")
+        ptype = e[4]
+        start = int.from_bytes(e[8:12], "little")
+        count = int.from_bytes(e[12:16], "little")
+        if ptype == 0 and start == 0 and count == 0:
+            continue
+        if ptype == 0xEE:
+            protective = True
+            continue
+        if ptype == 0:
+            raise ImageValidationError(f"MBR 分区 {i + 1} 类型为 0 但含非零起止")
+        if start == 0 or count == 0:
+            raise ImageValidationError(f"MBR 分区 {i + 1} 起始 LBA/长度非法")
+        if (start + count) * 512 > img_size:
+            raise ImageValidationError(f"MBR 分区 {i + 1} 超出镜像范围")
+        entries.append((ptype, start, count))
+    return entries, protective
+
+
+def _validate_gpt(head: bytes, img_size: int, sector: int) -> dict:
+    """校验 GPT 头/分区表 CRC 与分区范围（支持 512B/4K 逻辑扇区）。"""
+    off = sector
+    if len(head) < off + 92:
+        raise ImageValidationError("镜像过小，不足以容纳 GPT 头")
+    if head[off:off + 8] != b"EFI PART":
+        raise ImageValidationError("GPT 签名缺失")
+    hsize = int.from_bytes(head[off + 12:off + 16], "little")
+    if not (92 <= hsize <= sector) or len(head) < off + hsize:
+        raise ImageValidationError(f"GPT 头长度异常: {hsize}")
+    hdr = bytearray(head[off:off + hsize])
+    stored_crc = int.from_bytes(hdr[16:20], "little")
+    hdr[16:20] = b"\x00" * 4
+    if _crc32(bytes(hdr)) != stored_crc:
+        raise ImageValidationError("GPT 头 CRC 不符（头部损坏）")
+    my_lba = int.from_bytes(hdr[24:32], "little")
+    if my_lba != 1:
+        raise ImageValidationError(f"GPT 头 MyLBA={my_lba}，不是位于 LBA1")
+    entry_lba = int.from_bytes(hdr[72:80], "little")
+    num = int.from_bytes(hdr[80:84], "little")
+    esize = int.from_bytes(hdr[84:88], "little")
+    arr_crc = int.from_bytes(hdr[88:92], "little")
+    if not (1 <= num <= 4096) or esize < 128 or esize % 128:
+        raise ImageValidationError(f"GPT 分区表参数异常: entries={num} size={esize}")
+    start = entry_lba * sector
+    total = num * esize
+    if entry_lba == 0 or start + total > img_size:
+        raise ImageValidationError("GPT 分区表超出镜像范围")
+    if start + total > len(head):
+        raise ImageValidationError("GPT 分区表超出预检读取范围")
+    arr = head[start:start + total]
+    if _crc32(arr) != arr_crc:
+        raise ImageValidationError("GPT 分区表 CRC 不符（分区表损坏）")
+    used = 0
+    disk_sectors = img_size // sector
+    for i in range(num):
+        e = arr[i * esize:(i + 1) * esize]
+        if not any(e[:16]):
+            continue
+        first = int.from_bytes(e[32:40], "little")
+        last = int.from_bytes(e[40:48], "little")
+        if last < first or first < 2 or last >= disk_sectors:
+            raise ImageValidationError(f"GPT 分区 {i + 1} 越界（{first}..{last}）")
+        used += 1
+    if used == 0:
+        raise ImageValidationError("GPT 没有有效分区项")
+    return {"kind": "GPT", "sector_size": sector, "partitions": used}
+
+
+def validate_image_layout(head: bytes, img_size: int) -> dict:
+    """完整磁盘镜像结构校验：必须有合法 MBR 或 GPT。
+
+    纯 0x55AA、文本、zip、空文件、分区越界、GPT CRC 错误一律拒绝；
+    仅支持整盘镜像（不支持单分区镜像/无分区表镜像）。"""
+    if img_size < 512:
+        raise ImageValidationError(f"镜像过小（{img_size} B），不是完整磁盘镜像")
+    if len(head) < 512 or head[510:512] != b"\x55\xaa":
+        raise ImageValidationError("不是完整磁盘镜像：缺少 MBR 引导签名 0x55AA")
+    mbr_entries, protective = _parse_mbr(head, img_size)
+    if protective:
+        for sector in (512, 4096):
+            if len(head) >= sector + 8 and head[sector:sector + 8] == b"EFI PART":
+                return _validate_gpt(head, img_size, sector)
+        raise ImageValidationError("存在 GPT 保护 MBR，但未找到有效 GPT 头")
+    if not mbr_entries:
+        raise ImageValidationError("MBR 中没有有效分区项")
+    return {"kind": "MBR", "sector_size": 512, "partitions": len(mbr_entries)}
+
+
 def analyze_image(path: str, progress=None, cancel=None) -> dict:
-    """解析镜像：返回压缩包/解压后大小与 sha256。缓存键 = 压缩包文件 sha256。"""
+    """解析并验证镜像：返回压缩包/解压后大小、sha256 与分区布局（MBR/GPT）。
+
+    缓存键 = 压缩包文件 sha256；旧缓存缺少结构验证结果时只补读头部复核，
+    不会绕过新增门禁。"""
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"文件不存在: {p}")
@@ -491,28 +691,47 @@ def analyze_image(path: str, progress=None, cancel=None) -> dict:
         gz_sha, gz_size = sha256_file(p, progress, cancel)
         cached = _cache_load(gz_sha)
         if cached:
+            if not cached.get("layout_ok"):
+                layout = validate_image_layout(
+                    _read_head(p, True), int(cached.get("img_size") or 0))
+                cached = {**cached, "layout": layout["kind"], "layout_ok": True}
+                _cache_store(gz_sha, cached, p.name)
             return {**cached, "gz_sha256": gz_sha, "gz_size": gz_size,
                     "cached": True, "path": str(p)}
         h = hashlib.sha256()
         n = 0
-        with open(p, "rb") as raw, gzip.GzipFile(fileobj=raw) as g:
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled()
-                d = g.read(CHUNK)
-                if not d:
-                    break
-                h.update(d)
-                n += len(d)
-                if progress:
-                    progress("dec", n, 0)
-        meta = {"img_sha256": h.hexdigest(), "img_size": n}
+        head = bytearray()
+        try:
+            with open(p, "rb") as raw:
+                if raw.read(2) != b"\x1f\x8b":
+                    raise ImageValidationError("扩展名为 .gz 但不是 gzip 数据（魔数不符）")
+                raw.seek(0)
+                with gzip.GzipFile(fileobj=raw) as g:
+                    while True:
+                        if cancel is not None and cancel.is_set():
+                            raise Cancelled()
+                        d = g.read(CHUNK)
+                        if not d:
+                            break
+                        if len(head) < HEADER_BYTES:
+                            head.extend(d[:HEADER_BYTES - len(head)])
+                        h.update(d)
+                        n += len(d)
+                        if progress:
+                            progress("dec", n, 0)
+        except (gzip.BadGzipFile, EOFError) as e:
+            raise ImageValidationError(f"gzip 镜像损坏或截断: {e}") from e
+        layout = validate_image_layout(bytes(head), n)
+        meta = {"img_sha256": h.hexdigest(), "img_size": n,
+                "layout": layout["kind"], "layout_ok": True}
         _cache_store(gz_sha, meta, p.name)
         return {**meta, "gz_sha256": gz_sha, "gz_size": gz_size,
                 "cached": False, "path": str(p)}
-    # 裸 .img：文件哈希即预期哈希
+    # 裸 .img：文件哈希即预期哈希；结构校验不可跳过
     sha, size = sha256_file(p, progress, cancel)
+    layout = validate_image_layout(_read_head(p, False), size)
     return {"img_sha256": sha, "img_size": size, "gz_sha256": sha, "gz_size": size,
+            "layout": layout["kind"], "layout_ok": True,
             "cached": False, "path": str(p)}
 
 
@@ -837,12 +1056,22 @@ class App:
         self.rows.clear()
         disks, denied = enumerate_disks()
         oversize = [d for d in disks if d["size"] > MAX_TARGET_BYTES]
-        disks = [d for d in disks if d["size"] <= MAX_TARGET_BYTES]
         notes = []
         if denied:
             notes.append(f"⚠ {denied} 个磁盘因权限未能访问（需管理员）")
         if oversize:
             notes.append(f"{len(oversize)} 个磁盘超过 {_fmt_size(MAX_TARGET_BYTES)} 未枚举（容量上限保护）")
+        try:
+            forbidden = source_disks(
+                [p for p in (self.var_path.get(), str(SCRIPT_DIR)) if p], disks
+            ) if disks else set()
+            src_ok = True
+        except VolumeSafetyError as e:
+            forbidden, src_ok = set(), False
+            notes.append(f"⚠ 无法判断源镜像/工具所在盘（禁止写入）: {e}")
+        self.forbidden = forbidden
+        self.src_ok = src_ok
+        disks = [d for d in disks if d["size"] <= MAX_TARGET_BYTES]
         self.lbl_denied.config(text="   ".join(notes))
         if not disks:
             self.lbl_empty = ttk.Label(self.list_frame,
@@ -852,7 +1081,7 @@ class App:
             self.lbl_empty.pack(anchor="w", pady=8)
             return
         for d in disks:
-            ok = selectable(d)
+            ok = selectable(d) and src_ok and d["index"] not in forbidden
             tag = "PhysicalDrive%d" % d["index"]
             info = f"{_fmt_size(d['size'])}  {d['bus_name']}  {d['model']}"
             if d["letters"]:
@@ -861,6 +1090,10 @@ class App:
                 info += "  ⛔系统盘"
             elif not d.get("volume_known", False):
                 info += "  ⛔卷枚举不可靠"
+            elif not src_ok:
+                info += "  ⛔源盘判定失败"
+            elif d["index"] in forbidden:
+                info += "  ⛔镜像/工具所在盘"
             elif not ok:
                 info += "  ⛔非可移除介质"
             elif not d["removable"]:
@@ -895,7 +1128,7 @@ class App:
         ready = bool(self.var_path.get()) and not self.running
         self.btn_start.config(state="normal" if (ready and n) else "disabled")
 
-    # ---- 镜像选择（选完即可开写；解析在开写时后台并行） ----
+    # ---- 镜像选择（写入前先完整预检） ----
     def browse(self):
         if self.running:
             return
@@ -912,10 +1145,10 @@ class App:
             gz_size = 0
         self.lbl_img.config(
             text=f"镜像: {path}\n压缩包 {_fmt_size(gz_size)}  |  "
-                 "写入是流式的（边解压边写），选好即可开始；解压大小/sha256 将在"
-                 "开始写入时后台解析（有缓存则秒出），用于写后对账。",
+                 "开始写入前会先完整预检（gzip 完整性/大小/sha256/MBR 或 GPT 结构），"
+                 "预检失败不会写入任何卡。",
             foreground="#333")
-        self._on_toggle()
+        self.refresh()  # 重新计算哪些盘是镜像/工具所在盘，必须禁用
 
     def _run_analyzer(self, path: str, meta_box: dict):
         """后台预扫描：算解压大小+sha256（带缓存），供写完后对账。"""
@@ -960,21 +1193,18 @@ class App:
             messagebox.showwarning("未选择目标", "请先勾选要写入的读卡器。")
             return
         disks, _ = enumerate_disks()  # 重新枚举，防中途拔插
-        by_idx = {d["index"]: d for d in disks}
-        targets, rejects = [], []
-        for i in picked:
-            d = by_idx.get(i)
-            if d is None:
-                rejects.append(f"PhysicalDrive{i}: 已不在位（可能被拔出）")
-            elif not selectable(d):
-                rejects.append(f"PhysicalDrive{i}: 不满足可写条件"
-                               f"（非可移除/系统盘/超 {_fmt_size(MAX_TARGET_BYTES)} 上限）")
-            elif self.meta and d["size"] < self.meta["img_size"]:
-                rejects.append(
-                    f"PhysicalDrive{i}: 容量 {_fmt_size(d['size'])} < 镜像 "
-                    f"{_fmt_size(self.meta['img_size'])}，装不下")
-            else:
-                targets.append(d)
+        forbidden: set[int] = set()
+        if disks:
+            try:
+                forbidden = source_disks([img_path, str(SCRIPT_DIR)], disks)
+            except VolumeSafetyError as e:
+                messagebox.showerror(
+                    "无法判断源盘，已中止",
+                    f"{e}\n\n无法排除镜像/工具所在物理盘时禁止写入。")
+                return
+        targets, rejects = partition_targets(
+            disks, picked, forbidden,
+            self.meta["img_size"] if self.meta else None)
         if rejects:
             messagebox.showerror("以下目标不可用，已中止", "\n".join(rejects))
             self.refresh()
@@ -984,8 +1214,8 @@ class App:
             img_txt = (f"解压后 {_fmt_size(self.meta['img_size'])}  "
                        f"sha256 {self.meta['img_sha256'][:16]}…")
         else:
-            img_txt = ("解压大小/sha256 后台解析中（不阻塞写入；"
-                       "卡容量若小于镜像，写入中途会报错）")
+            img_txt = ("镜像尚未预检：确定后先完整预检（结构/gzip CRC/sha256），"
+                       "通过后才开始写入；失败不会写入任何卡")
         tgt_txt = "\n".join(
             f"  PhysicalDrive{d['index']}  {_fmt_size(d['size'])}  {d['bus_name']}  "
             f"{d['model']}" + ("  卷:" + ",".join(x + ":" for x in d["letters"]) if d["letters"] else "")
@@ -1001,10 +1231,14 @@ class App:
 
         self.stop.clear()
         self.running = True
-        self.pending = len(targets)
+        self.pending = 0
         self.finals = []
+        self.meta = None
         self.rows_i = {d["index"]: d for d in targets}
-        # 共享元数据盒：写入线程开写不等待，写完 EOF 后才等预扫描结果对账
+        self._pending_targets = targets
+        self._pending_img = img_path
+        self._pending_verify = self.var_verify.get()  # 启动快照：之后改 UI 不影响本任务
+        # 预检必须先完成：写入线程在 _preflight_ready() 成功后才启动
         self.meta_box = {"meta": None, "error": None, "ready": threading.Event()}
         self._set_running(True)
         for i, _r in self.rows.items():
@@ -1013,14 +1247,69 @@ class App:
             else:
                 self.rows[i]["bar"].config(mode="indeterminate", value=0)
                 self.rows[i]["bar"].start(40)
-                self.rows[i]["status"].config(text="写入中…", fg="#0a5bb5")
+                self.rows[i]["status"].config(text="预检中…", fg="#b26a00")
         threading.Thread(target=self._run_analyzer, args=(img_path, self.meta_box),
                          daemon=True).start()
+
+    def _preflight_ready(self):
+        """预检成功后才启动写入线程；此时再复核目标（预检可能耗时，盘可能被拔插）。"""
+        if not self.running:
+            return
+        meta = self.meta
+        if not meta or not meta.get("layout_ok"):
+            self._abort_preflight("预检未产生有效的整盘镜像信息")
+            return
+        old_indices = [d["index"] for d in self._pending_targets]
+        disks, _ = enumerate_disks()
+        forbidden: set[int] = set()
+        if disks:
+            try:
+                forbidden = source_disks([self._pending_img, str(SCRIPT_DIR)], disks)
+            except VolumeSafetyError as e:
+                self._abort_preflight(f"无法判断源盘: {e}")
+                return
+        targets, rejects = partition_targets(disks, old_indices, forbidden, meta["img_size"])
+        if rejects:
+            self._abort_preflight("预检后目标不可用，未写入任何卡：\n"
+                                  + "\n".join(rejects))
+            return
+        self.pending = len(targets)
+        self.rows_i = {d["index"]: d for d in targets}
+        for i, r in self.rows.items():
+            if i not in self.rows_i:
+                r["status"].config(text="未参与", fg="#aaa")
+            else:
+                try:
+                    r["bar"].stop()
+                except Exception:
+                    pass
+                r["bar"].config(mode="indeterminate", value=0)
+                r["bar"].start(40)
+                r["status"].config(text="写入中…", fg="#0a5bb5")
+        self.lbl_status.config(
+            text=f"预检通过（{meta.get('layout', '?')}）。开始写入…",
+            foreground="#0a5bb5")
         for d in targets:
             threading.Thread(
                 target=flash_one,
-                args=(d, img_path, self.var_verify.get(), self.stop, self.q, self.meta_box),
+                args=(d, self._pending_img, self._pending_verify,
+                      self.stop, self.q, self.meta_box),
                 daemon=True).start()
+
+    def _abort_preflight(self, text: str):
+        self.running = False
+        self.pending = 0
+        self._set_running(False)
+        for r in self.rows.values():
+            try:
+                r["bar"].stop()
+            except Exception:
+                pass
+            r["bar"].config(mode="determinate", value=0)
+            r["status"].config(text="未开始", fg="#888")
+        self.lbl_status.config(text=f"预检失败，未写入任何卡: {text}",
+                               foreground="#b3261e")
+        messagebox.showerror("镜像预检失败", f"{text}\n\n未向任何磁盘写入数据。")
 
     def cancel(self):
         if self.running:
@@ -1060,11 +1349,15 @@ class App:
                 self.lbl_img.config(
                     text=f"镜像: {m['path']}\n压缩包 {_fmt_size(m['gz_size'])}  "
                          f"sha256 {m['gz_sha256'][:16]}…  |  解压后 {_fmt_size(m['img_size'])}  "
-                         f"sha256 {m['img_sha256'][:16]}…  ({cache_tag})",
+                         f"sha256 {m['img_sha256'][:16]}…  布局 {m.get('layout', '?')}"
+                         f"  ({cache_tag})",
                     foreground="#333")
+                self._preflight_ready()
             else:
                 self.meta = None
                 self.lbl_img.config(text=text, foreground="#b3261e")
+                if self.running:
+                    self._abort_preflight(text)
         elif kind == "phase":
             _, idx, text = msg
             color = {"写入": "#0a5bb5", "校验": "#7a4fb5", "锁定卷": "#555"}.get(text, "#555")
@@ -1220,7 +1513,12 @@ def cli_image(path: str) -> int:
         else:
             print(f"\r流式解压中… {_fmt_size(done)}", end="", flush=True)
 
-    meta = analyze_image(path, prog)
+    try:
+        meta = analyze_image(path, prog)
+    except (ImageValidationError, OSError) as e:
+        print()
+        print(f"镜像无效: {e}", file=sys.stderr)
+        return 2
     print()
     print(f"镜像: {meta['path']}")
     print(f"压缩包: {meta['gz_size']:,} B ({_fmt_size(meta['gz_size'])})  "
@@ -1239,29 +1537,28 @@ def cli_flash(args) -> int:
                           + (["--yes"] if args.yes else []))
         return 1
     print("解析镜像…")
-    meta = analyze_image(args.flash)
+    try:
+        meta = analyze_image(args.flash)
+    except (ImageValidationError, OSError) as e:
+        print(f"镜像无效，已中止: {e}")
+        return 2
     print(f"解压后 {meta['img_size']:,} B ({_fmt_size(meta['img_size'])})  "
-          f"sha256 {meta['img_sha256'][:16]}…")
+          f"sha256 {meta['img_sha256'][:16]}…  布局 {meta.get('layout', '?')}")
     disks, _ = enumerate_disks()
     try:
         want = {int(x) for x in args.drives.replace(",", " ").split()}
     except ValueError:
         print("--drives 格式应为物理盘号列表，如 --drives 2,3（先 --list 查看）")
         return 2
-    targets = [d for d in disks if d["index"] in want]
-    bad = []
-    for i in sorted(want - {d["index"] for d in targets}):
-        bad.append(f"PhysicalDrive{i}: 不在位或不可访问")
-    for d in targets:
-        if not selectable(d):
-            if d["size"] > MAX_TARGET_BYTES:
-                bad.append(f"PhysicalDrive{d['index']}: 容量 {_fmt_size(d['size'])} "
-                           f"超过 {_fmt_size(MAX_TARGET_BYTES)} 上限，拒绝写入")
-            else:
-                bad.append(f"PhysicalDrive{d['index']}: 非可移除介质/系统盘，拒绝写入")
-        elif d["size"] < meta["img_size"]:
-            bad.append(f"PhysicalDrive{d['index']}: 容量不足 "
-                       f"{_fmt_size(d['size'])} < {_fmt_size(meta['img_size'])}")
+    forbidden: set[int] = set()
+    if disks:
+        try:
+            forbidden = source_disks([args.flash, str(SCRIPT_DIR)], disks)
+        except VolumeSafetyError as e:
+            print("目标不可用，已中止：")
+            print(f"  无法判断源镜像/工具所在物理盘: {e}")
+            return 1
+    targets, bad = partition_targets(disks, sorted(want), forbidden, meta["img_size"])
     if bad:
         print("目标不可用，已中止：")
         print("\n".join("  " + b for b in bad))

@@ -23,9 +23,23 @@ TEST = Path(__file__).resolve().parent / "test_img.gz"
 
 
 def build_image(mib: int = 16) -> dict:
-    """确定性伪随机 16MiB → gzip，返回预期 meta。"""
-    block = bytes(range(256)) * 4096  # 1 MiB 确定性数据
-    raw = block * mib
+    """确定性 16MiB 整盘镜像（合法 MBR + 伪随机数据）→ gzip，返回预期 meta。"""
+    total = mib << 20
+    start_lba = 2048
+    count = total // 512 - start_lba
+    mbr = bytearray(512)
+    entry = bytearray(16)              # 分区项 1：type=0x83，起点 1MiB，覆盖到镜像末尾
+    entry[1:4] = b"\xfe\xff\xff"       # CHS 起始（占位，结构校验不依赖 CHS）
+    entry[4] = 0x83
+    entry[5:8] = b"\xfe\xff\xff"       # CHS 结束（占位）
+    entry[8:12] = start_lba.to_bytes(4, "little")
+    entry[12:16] = count.to_bytes(4, "little")
+    mbr[446:462] = entry
+    mbr[510:512] = b"\x55\xaa"
+    block = bytes(range(256)) * 4096   # 1 MiB 确定性数据
+    body = bytearray(block * mib)
+    body[:512] = mbr
+    raw = bytes(body)
     h = hashlib.sha256(raw)
     with gzip.open(TEST, "wb", compresslevel=6) as g:
         g.write(raw)

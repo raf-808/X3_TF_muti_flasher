@@ -834,15 +834,21 @@ def flash_one(target: dict, img_path: str, verify: bool,
     meta_box = {"meta": dict|None, "error": str|None, "ready": Event}：
     写入不等待预扫描——写到 EOF 后才等 ready（预扫描通常远早于写完），
     再对账字节数与 sha256。进度事件的 total 为 0 表示解压大小尚未可知。
-    """
+
+    语义：逻辑字节数/sha256 只覆盖镜像原始内容；末尾不足一扇区的补零只用于
+    介质 I/O，不参与对账，读回也只校验原始长度。结果 bytes=逻辑字节，
+    written_bytes=实际写入设备字节（向上对齐）。"""
     idx = target["index"]
     res = {
         "drive": idx, "model": target["model"], "serial": target.get("serial", ""),
         "size": target["size"], "letters": target.get("letters", []),
-        "bytes": 0, "ok": False, "cancelled": False, "error": None, "warns": [],
+        "bytes": 0, "written_bytes": 0, "ok": False, "cancelled": False,
+        "error": None, "warns": [],
     }
     f = None
     held = []
+    logical_n = 0   # 逻辑镜像字节（对账与结果 bytes）
+    written_n = 0   # 实际写入设备字节（含尾部补零）
     t0 = time.time()
     try:
         q.put(("phase", idx, "锁定卷"))
@@ -859,7 +865,6 @@ def flash_one(target: dict, img_path: str, verify: bool,
 
         sector = target.get("sector") or 512
         sha = hashlib.sha256()
-        n = 0
         buf = bytearray()
         q.put(("phase", idx, "写入"))
 
@@ -881,19 +886,21 @@ def flash_one(target: dict, img_path: str, verify: bool,
                     w = bytes(buf[:CHUNK])
                     _write_all(f, w)
                     sha.update(w)
-                    n += CHUNK
+                    logical_n += CHUNK
+                    written_n += CHUNK
                     del buf[:CHUNK]
-                    speed = n / max(time.time() - t0, 1e-6) / 1e6
-                    q.put(("prog", idx, n, known_total(), speed))
-            tail = bytes(buf)
-            if tail:
-                pad = (-len(tail)) % sector
+                    speed = logical_n / max(time.time() - t0, 1e-6) / 1e6
+                    q.put(("prog", idx, logical_n, known_total(), speed))
+            raw_tail = bytes(buf)
+            if raw_tail:
+                pad = (-len(raw_tail)) % sector
                 if pad:
                     res["warns"].append(f"镜像尾部非扇区对齐，补零 {pad}B")
-                    tail += b"\x00" * pad
-                _write_all(f, tail)
-                sha.update(tail)
-                n += len(tail)
+                # 补零只写设备，不进 sha/逻辑字节
+                _write_all(f, raw_tail + b"\x00" * pad)
+                sha.update(raw_tail)
+                logical_n += len(raw_tail)
+                written_n += len(raw_tail) + pad
 
         f.flush()  # FlushFileBuffers：直落盘（等效原 fsync）
 
@@ -902,8 +909,8 @@ def flash_one(target: dict, img_path: str, verify: bool,
         meta = meta_box["meta"]
         if meta is None:
             raise OSError(f"镜像预扫描失败，无法对账: {meta_box['error']}")
-        if n != meta["img_size"]:
-            raise OSError(f"写入字节数不符: {n} != {meta['img_size']}"
+        if logical_n != meta["img_size"]:
+            raise OSError(f"写入字节数不符: {logical_n} != {meta['img_size']}"
                           "（若卡容量小于镜像会出现此错）")
         if sha.hexdigest() != meta["img_sha256"]:
             raise OSError("写入流 sha256 与镜像预期哈希不符")
@@ -913,26 +920,28 @@ def flash_one(target: dict, img_path: str, verify: bool,
             f.seek(0)
             vsha = hashlib.sha256()
             m = 0
-            while m < n:
+            while m < logical_n:  # 只读回原始镜像区间，不校验尾部补零
                 if stop.is_set():
                     raise Cancelled()
-                d = f.read(min(CHUNK, n - m))
+                d = f.read(min(CHUNK, logical_n - m))
                 if not d:
                     raise OSError(f"读回提前到 EOF（offset {m}）——卡可能已掉线")
                 vsha.update(d)
                 m += len(d)
                 speed = m / max(time.time() - t0, 1e-6) / 1e6
-                q.put(("prog", idx, m, n, speed))
+                q.put(("prog", idx, m, logical_n, speed))
             if vsha.hexdigest() != meta["img_sha256"]:
                 raise OSError("读回校验 sha256 不匹配——卡可能损坏或为扩容假卡，请换卡重试")
 
         f.close()
         f = None
-        res.update(ok=True, bytes=n, secs=time.time() - t0)
+        res.update(ok=True, bytes=logical_n, written_bytes=written_n,
+                   secs=time.time() - t0)
         q.put(("final", idx, res))
         return res
     except Cancelled:
-        res.update(cancelled=True, error="已取消", secs=time.time() - t0, bytes=n if f else 0)
+        res.update(cancelled=True, error="已取消", secs=time.time() - t0,
+                   bytes=logical_n, written_bytes=written_n)
     except Exception as e:  # noqa: BLE001 — 统一落台账
         res.update(error=str(e), secs=time.time() - t0)
     finally:

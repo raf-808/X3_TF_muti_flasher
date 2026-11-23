@@ -22,8 +22,8 @@ import vhd_guard  # noqa: E402
 TEST = Path(__file__).resolve().parent / "test_img.gz"
 
 
-def build_image(mib: int = 16) -> dict:
-    """确定性 16MiB 整盘镜像（合法 MBR + 伪随机数据）→ gzip，返回预期 meta。"""
+def build_image(mib: int = 16, tail: int = 0) -> dict:
+    """确定性整盘镜像（合法 MBR + 伪随机数据 + 可选非对齐尾部）→ gzip。"""
     total = mib << 20
     start_lba = 2048
     count = total // 512 - start_lba
@@ -39,7 +39,7 @@ def build_image(mib: int = 16) -> dict:
     block = bytes(range(256)) * 4096   # 1 MiB 确定性数据
     body = bytearray(block * mib)
     body[:512] = mbr
-    raw = bytes(body)
+    raw = bytes(body) + b"\xab" * tail
     h = hashlib.sha256(raw)
     with gzip.open(TEST, "wb", compresslevel=6) as g:
         g.write(raw)
@@ -48,7 +48,10 @@ def build_image(mib: int = 16) -> dict:
 
 
 def main() -> int:
-    idx = int(sys.argv[1]) if len(sys.argv) > 1 else -1
+    argv = sys.argv[1:]
+    tail = 1 if "--tail" in argv else 0
+    nums = [a for a in argv if a.isdigit()]
+    idx = int(nums[0]) if nums else -1
     disks, _ = t.enumerate_disks()
     if idx < 0:
         try:
@@ -72,8 +75,9 @@ def main() -> int:
     print(f"目标: PhysicalDrive{idx}  {t._fmt_size(target['size'])}  bus={target['bus']}  "
           f"sector={target.get('sector')}  VHD={vhd_path.name}", flush=True)
 
-    meta = build_image()
-    print(f"测试镜像: {meta['img_size']:,} B  sha256 {meta['img_sha256'][:16]}…", flush=True)
+    meta = build_image(tail=tail)
+    print(f"测试镜像: {meta['img_size']:,} B  sha256 {meta['img_sha256'][:16]}…"
+          f"  尾部补齐={'是(+%dB)' % tail if tail else '否'}", flush=True)
     meta_box = {"meta": meta, "error": None, "ready": threading.Event()}
     meta_box["ready"].set()
 

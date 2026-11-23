@@ -42,7 +42,6 @@ import hashlib
 import json
 import os
 import queue
-import string
 import subprocess
 import sys
 import threading
@@ -74,6 +73,10 @@ class Cancelled(Exception):
     """用户取消。"""
 
 
+class VolumeSafetyError(RuntimeError):
+    """卷枚举/锁定/弹出不可靠——目标盘必须拒写（不得写入任何字节）。"""
+
+
 # ----------------------------------------------------------------------------
 # Win32 原生层：物理磁盘枚举 / 卷锁定
 # ----------------------------------------------------------------------------
@@ -91,6 +94,13 @@ kernel32.DeviceIoControl.argtypes = [
 kernel32.SetFilePointerEx.argtypes = [
     wintypes.HANDLE, wintypes.LARGE_INTEGER, ctypes.POINTER(wintypes.LARGE_INTEGER), wintypes.DWORD,
 ]
+kernel32.FindFirstVolumeW.restype = wintypes.HANDLE
+kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+kernel32.FindNextVolumeW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD]
+kernel32.FindVolumeClose.argtypes = [wintypes.HANDLE]
+kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
+    wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+]
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -105,6 +115,12 @@ FSCTL_DISMOUNT_VOLUME = 0x00090020
 IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
 IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+
+ERROR_INVALID_FUNCTION = 1
+ERROR_NO_MORE_FILES = 18
+ERROR_NOT_SUPPORTED = 50
+ERROR_MORE_DATA = 234
 
 BUS_NAMES = {
     0: "未知", 1: "SCSI", 2: "ATAPI", 3: "ATA", 4: "1394", 6: "FC", 7: "USB",
@@ -137,6 +153,24 @@ class STORAGE_DEVICE_NUMBER(ctypes.Structure):
     _fields_ = [
         ("DeviceType", wintypes.DWORD), ("DeviceNumber", wintypes.DWORD),
         ("PartitionNumber", wintypes.DWORD),
+    ]
+
+
+MAX_VOLUME_EXTENTS = 32
+
+
+class DISK_EXTENT(ctypes.Structure):
+    _fields_ = [
+        ("DiskNumber", wintypes.DWORD),
+        ("StartingOffset", ctypes.c_longlong),
+        ("ExtentLength", ctypes.c_longlong),
+    ]
+
+
+class VOLUME_DISK_EXTENTS(ctypes.Structure):
+    _fields_ = [
+        ("NumberOfDiskExtents", wintypes.DWORD),
+        ("Extents", DISK_EXTENT * MAX_VOLUME_EXTENTS),
     ]
 
 
@@ -203,43 +237,119 @@ def _disk_size(h: int) -> int:
     return 0
 
 
-def _local_volume_letters() -> list:
-    """返回本地卷盘符列表（仅对象管理器查询，绝不阻塞）。
-    网络映射盘断网时打开 \\\\.\\X: 会阻塞 ~20s/个（SMB 超时），必须先过滤掉：
-    只保留 QueryDosDeviceW 指向 \\Device\\Harddisk* 的盘符。"""
-    out = []
-    for L in string.ascii_uppercase:
-        buf = ctypes.create_unicode_buffer(512)
-        n = kernel32.QueryDosDeviceW(f"{L}:", buf, 512)
-        if n and buf.value.startswith("\\Device\\Harddisk"):
-            out.append(L)
-    return out
+def _find_volumes() -> list[str]:
+    r"""枚举全部本地卷（\\?\Volume{GUID}\ 形式），包含无盘符/仅目录挂载的卷。
+
+    走 FindFirstVolume/FindNextVolume，不碰网络映射盘（不会触发 SMB 超时）。"""
+    buf = ctypes.create_unicode_buffer(261)
+    h = kernel32.FindFirstVolumeW(buf, len(buf))
+    if not h or h == INVALID_HANDLE:
+        err = ctypes.get_last_error()
+        if err == ERROR_NO_MORE_FILES:
+            return []
+        raise VolumeSafetyError(f"FindFirstVolumeW 失败 err={err}")
+    names = []
+    try:
+        while True:
+            names.append(buf.value)
+            if not kernel32.FindNextVolumeW(h, buf, len(buf)):
+                err = ctypes.get_last_error()
+                if err == ERROR_NO_MORE_FILES:
+                    break
+                raise VolumeSafetyError(f"FindNextVolumeW 失败 err={err}")
+    finally:
+        kernel32.FindVolumeClose(h)
+    return names
 
 
-def _volume_map() -> tuple[dict, set]:
-    """盘符 → 物理盘号映射；(映射表, 系统卷所在物理盘号集合)。只碰本地卷。"""
-    letters: dict[str, int] = {}
-    for L in _local_volume_letters():
-        h = _open(f"\\\\.\\{L}:", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE)
-        if h is None:
+def _volume_mount_paths(volume: str) -> list[str]:
+    """卷的全部挂载点（盘符根目录与目录挂载点）。"""
+    size = 1024
+    while True:
+        buf = ctypes.create_unicode_buffer(size)
+        need = wintypes.DWORD(0)
+        if kernel32.GetVolumePathNamesForVolumeNameW(volume, buf, size, ctypes.byref(need)):
+            raw = ctypes.wstring_at(buf, need.value)
+            return [p for p in raw.split("\x00") if p]
+        err = ctypes.get_last_error()
+        if err == ERROR_MORE_DATA and need.value > size:
+            size = int(need.value)
             continue
-        num = STORAGE_DEVICE_NUMBER()
-        if _ioctl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, None, num):
-            letters[L] = int(num.DeviceNumber)
+        raise VolumeSafetyError(f"查询卷 {volume} 挂载点失败 err={err}")
+
+
+def _volume_extents(h: int, volume: str) -> list[tuple[int, int, int]] | None:
+    """卷 → (物理盘号, 起始偏移, 长度) 列表；非磁盘卷（如光驱）返回 None。"""
+    vde = VOLUME_DISK_EXTENTS()
+    if not _ioctl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, vde):
+        err = ctypes.get_last_error()
+        if err in (ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED):
+            return None
+        raise VolumeSafetyError(f"查询卷 {volume} 磁盘 extent 失败 err={err}")
+    n = int(vde.NumberOfDiskExtents)
+    if n <= 0 or n > MAX_VOLUME_EXTENTS:
+        raise VolumeSafetyError(f"卷 {volume} extent 数量异常: {n}")
+    return [(int(vde.Extents[i].DiskNumber),
+             int(vde.Extents[i].StartingOffset),
+             int(vde.Extents[i].ExtentLength)) for i in range(n)]
+
+
+def _volume_info(name: str) -> dict | None:
+    # 卷设备必须去掉尾部反斜杠打开（带尾杠会被当成根目录 → err=3）；
+    # 访问权限用 0 即可查询 extent，非管理员也能安全枚举拓扑。
+    h = _open(name.rstrip("\\"), 0, FILE_SHARE_READ | FILE_SHARE_WRITE)
+    if h is None:
+        raise VolumeSafetyError(f"打开卷 {name} 失败 err={ctypes.get_last_error()}")
+    try:
+        extents = _volume_extents(h, name)
+        if extents is None:
+            return None
+        mounts = _volume_mount_paths(name)
+    finally:
         kernel32.CloseHandle(h)
-    by_disk: dict[int, list] = {}
-    for L, dn in letters.items():
-        by_disk.setdefault(dn, []).append(L)
-    sys_disks = set()
-    sysdrive = os.environ.get("SystemDrive", "C:").rstrip(":").upper()
-    if sysdrive in letters:
-        sys_disks.add(letters[sysdrive])
+    letters = sorted({p[0].upper() for p in mounts
+                      if len(p) == 3 and p[1] == ":" and p[2] == "\\" and p[0].isalpha()})
+    return {"name": name, "mounts": mounts, "letters": letters,
+            "disks": sorted({e[0] for e in extents}), "extents": extents}
+
+
+def _map_volumes(infos: list[dict]) -> tuple[dict[int, list[dict]], set[int]]:
+    """卷信息列表 → (物理盘号 → 卷列表, 系统卷所在盘号集合)。
+
+    跨多个 extent（多个物理盘）的卷会归入每个相关盘，锁定/拒写时都覆盖。"""
+    by_disk: dict[int, list[dict]] = {}
+    for info in infos:
+        for disk in info["disks"]:
+            by_disk.setdefault(disk, []).append(info)
+    sysdrive = os.environ.get("SystemDrive", "C:").rstrip(":").upper() + ":\\"
+    sys_disks = {
+        disk for disk, vols in by_disk.items()
+        if any(str(p).upper() == sysdrive for v in vols for p in v["mounts"])
+    }
     return by_disk, sys_disks
+
+
+def scan_volumes() -> tuple[dict[int, list[dict]], set[int], str | None]:
+    """完整枚举本地卷并按物理盘归档。
+
+    返回 (盘号 → 卷信息列表, 系统卷所在盘号集合, 错误信息)。
+    错误信息非 None 表示卷拓扑不可靠，任何写盘都必须拒绝——不能把枚举失败
+    当成“空盘”。成功且某盘无任何卷，才是真正的空白盘。"""
+    try:
+        infos = []
+        for name in _find_volumes():
+            info = _volume_info(name)
+            if info is not None:
+                infos.append(info)
+        by_disk, sys_disks = _map_volumes(infos)
+        return by_disk, sys_disks, None
+    except Exception as e:  # noqa: BLE001 — 统一转成“不可靠”信号
+        return {}, set(), str(e)
 
 
 def enumerate_disks() -> tuple[list, int]:
     """枚举物理磁盘。返回 (磁盘列表, 因权限无法访问的个数)。"""
-    by_disk, sys_disks = _volume_map()
+    by_disk, sys_disks, vol_err = scan_volumes()
     disks, denied, miss = [], 0, 0
     for i in range(33):
         h = _open(f"\\\\.\\PhysicalDrive{i}", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -272,45 +382,60 @@ def enumerate_disks() -> tuple[list, int]:
             "sector": sector,
             "removable": prop.get("removable", False),
             "media_removable": media_removable,  # 几何查询的介质类型（部分 USB 读卡器可移除位=0）
-            "letters": sorted(by_disk.get(i, [])),
+            "letters": sorted({L for v in by_disk.get(i, []) for L in v["letters"]}),
             "is_system": i in sys_disks,
+            "volumes": by_disk.get(i, []),
+            "volume_known": vol_err is None,
         })
     return disks, denied
 
 
 def selectable(d: dict) -> bool:
-    """可写目标判定：有容量、非系统盘、可移除介质、≤64 GiB。
+    """可写目标判定：有容量、非系统盘、可移除介质、≤64 GiB、卷拓扑可信。
     可移除判定三选一：属性 RemovableMedia 位 / 几何查询 MediaType=RemovableMedia
-    （部分 USB 读卡器固件把可移除位报成 0）/ SD/MMC 总线。"""
+    （部分 USB 读卡器固件把可移除位报成 0）/ SD/MMC 总线。
+    卷枚举失败时 volume_known=False，一律不可选（不能把枚举失败当空盘）。"""
     return (
         0 < d["size"] <= MAX_TARGET_BYTES
         and not d["is_system"]
+        and d.get("volume_known", False)
         and (d["removable"] or d.get("media_removable", False) or d["bus"] in (12, 13))
     )
 
 
-def lock_volumes(letters: list) -> tuple[list, list]:
-    """对目标盘所有卷尝试锁定+弹出（句柄保持打开以维持锁定）。
-    返回 (成功锁定的句柄列表, 警告文案列表)。
-    注意：打开卷必须带 FILE_SHARE_READ|WRITE——挂载中的卷用 share=0 打开会
-    直接 err=32 sharing violation（即使管理员）；独占靠 FSCTL_LOCK 实现。"""
-    held, warns = [], []
-    for L in letters:
-        h = _open(f"\\\\.\\{L}:", GENERIC_READ | GENERIC_WRITE,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE)
-        if h is None:
-            warns.append(f"卷 {L}: 打开失败 err={ctypes.get_last_error()}")
-            continue
-        locked = _ioctl(h, FSCTL_LOCK_VOLUME)
-        dismounted = _ioctl(h, FSCTL_DISMOUNT_VOLUME)
-        if dismounted:
+def lock_target_volumes(disk_index: int, volumes: list[dict] | None = None) -> list[int]:
+    """锁定并弹出目标盘关联的全部卷；任何失败抛 VolumeSafetyError 并释放全部句柄。
+
+    volumes 为 None 时现场重新枚举（GUI 列表可能已过期）。只有“枚举成功且该盘
+    确实没有任何卷”的空白盘才允许继续；枚举失败不能当成空盘。
+    打开卷必须带 FILE_SHARE_READ|WRITE——挂载中的卷 share=0 会直接 err=32
+    sharing violation；独占靠 FSCTL_LOCK_VOLUME，而非 share 标志。"""
+    if volumes is None:
+        by_disk, _sys_disks, err = scan_volumes()
+        if err:
+            raise VolumeSafetyError(f"卷枚举失败，拒绝写入: {err}")
+        volumes = by_disk.get(disk_index, [])
+    held: list[int] = []
+    try:
+        for vol in volumes:
+            name = vol["name"]
+            h = _open(name.rstrip("\\"), GENERIC_READ | GENERIC_WRITE,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE)
+            if h is None:
+                raise VolumeSafetyError(
+                    f"卷 {name} 打开失败 err={ctypes.get_last_error()}")
             held.append(h)
-            if not locked:
-                warns.append(f"卷 {L}: 未能独占锁定（可能有程序占用），已弹出后继续")
-        else:
+            if not _ioctl(h, FSCTL_LOCK_VOLUME):
+                raise VolumeSafetyError(
+                    f"卷 {name} 独占锁定失败 err={ctypes.get_last_error()}")
+            if not _ioctl(h, FSCTL_DISMOUNT_VOLUME):
+                raise VolumeSafetyError(
+                    f"卷 {name} 弹出失败 err={ctypes.get_last_error()}")
+        return held
+    except Exception:
+        for h in held:
             kernel32.CloseHandle(h)
-            warns.append(f"卷 {L}: 锁定/弹出均失败 err={ctypes.get_last_error()}（继续原样写入）")
-    return held, warns
+        raise
 
 
 def is_admin() -> bool:
@@ -502,10 +627,8 @@ def flash_one(target: dict, img_path: str, verify: bool,
     t0 = time.time()
     try:
         q.put(("phase", idx, "锁定卷"))
-        held, warns = lock_volumes(target.get("letters", []))
-        for w in warns:
-            res["warns"].append(w)
-            q.put(("warn", idx, w))
+        # 现场重新枚举卷并全量锁定/弹出；失败即抛错，绝不打开 PhysicalDrive 写句柄。
+        held = lock_target_volumes(idx)
 
         h = _open(f"\\\\.\\PhysicalDrive{idx}", GENERIC_READ | GENERIC_WRITE,
                   FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -736,6 +859,8 @@ class App:
                 info += "  卷:" + ",".join(x + ":" for x in d["letters"])
             if d["is_system"]:
                 info += "  ⛔系统盘"
+            elif not d.get("volume_known", False):
+                info += "  ⛔卷枚举不可靠"
             elif not ok:
                 info += "  ⛔非可移除介质"
             elif not d["removable"]:

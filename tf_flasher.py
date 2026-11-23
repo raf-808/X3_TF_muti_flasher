@@ -844,6 +844,7 @@ def flash_one(target: dict, img_path: str, verify: bool,
         "size": target["size"], "letters": target.get("letters", []),
         "bytes": 0, "written_bytes": 0, "ok": False, "cancelled": False,
         "error": None, "warns": [],
+        "verify_requested": bool(verify), "verify_completed": False,
     }
     f = None
     held = []
@@ -932,6 +933,7 @@ def flash_one(target: dict, img_path: str, verify: bool,
                 q.put(("prog", idx, m, logical_n, speed))
             if vsha.hexdigest() != meta["img_sha256"]:
                 raise OSError("读回校验 sha256 不匹配——卡可能损坏或为扩容假卡，请换卡重试")
+            res["verify_completed"] = True
 
         f.close()
         f = None
@@ -991,6 +993,7 @@ class App:
         self.finals: list = []
         self.rows_i: dict = {}
         self.rows: dict[int, dict] = {}
+        self._pending_verify = True   # 本任务启动时冻结的“读回校验”选项
 
         root.title("X3 批量写卡工具（img.gz → 多 TF 读卡器）")
         icon_file = Path(__file__).resolve().parent / "assets" / "tf_flasher.ico"
@@ -1040,8 +1043,10 @@ class App:
         opt = ttk.Frame(main)
         opt.pack(fill="x", pady=8)
         self.var_verify = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt, text="写入后读回校验（整卡 sha256 比对，防坏块/扩容卡，推荐）",
-                        variable=self.var_verify).pack(side="left")
+        self.chk_verify = ttk.Checkbutton(
+            opt, text="写入后读回校验（整卡 sha256 比对，防坏块/扩容卡，推荐）",
+            variable=self.var_verify)
+        self.chk_verify.pack(side="left")
         self.btn_start = ttk.Button(opt, text="开始写入", command=self.start, state="disabled")
         self.btn_start.pack(side="right")
         self.btn_cancel = ttk.Button(opt, text="取消", command=self.cancel,
@@ -1331,6 +1336,7 @@ class App:
         self.btn_all.config(state=st)
         self.btn_browse.config(state=st)
         self.btn_cancel.config(state="normal" if running else "disabled")
+        self.chk_verify.config(state=st)  # 运行期不可改；结果以启动快照/逐盘记录为准
         for r in self.rows.values():
             r["cb"].config(state="disabled" if running
                            else ("normal" if r["ok"] else "disabled"))
@@ -1420,13 +1426,16 @@ class App:
         self._set_running(False)
         results = self.finals
         ok_n = sum(1 for r in results if r["ok"])
+        verify_snapshot = self._pending_verify
         log_path = write_run_log(self.var_path.get(), self.meta,
-                                 self.var_verify.get(), results)
+                                 verify_snapshot, results)
         lines = []
         for res in sorted(results, key=lambda x: x["drive"]):
             if res["ok"]:
+                tag = ("校验通过" if res.get("verify_completed")
+                       else "写入完成（未读回校验）")
                 lines.append(f"✔ PhysicalDrive{res['drive']}  {res['model']}  "
-                             f"写入+{'校验通过' if self.var_verify.get() else '完成'}  "
+                             f"写入+{tag}  "
                              f"{_fmt_dur(res.get('secs', 0))}  "
                              f"{res['bytes'] / max(res.get('secs', 1), 1) / 1e6:.0f} MB/s")
             elif res.get("cancelled"):

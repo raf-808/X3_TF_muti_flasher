@@ -7,7 +7,13 @@ flasher_dist/
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
 flasher_build/venv/
+
+# PyInstaller 工作目录与默认输出目录（产物在 flasher_dist/，中间文件可重建）
+/build/
+/dist/
 
 # 测试台产物（diskpart 脚本 / 临时测试镜像 / VHD）
 flasher_build/*.txt

@@ -642,6 +642,12 @@ class App:
         self.rows: dict[int, dict] = {}
 
         root.title("X3 批量写卡工具（img.gz → 多 TF 读卡器）")
+        icon_file = Path(__file__).resolve().parent / "assets" / "tf_flasher.ico"
+        if icon_file.is_file():
+            try:
+                root.iconbitmap(default=str(icon_file))
+            except tk.TclError:
+                pass  # 图标是可选资源，不影响写卡工具启动
         root.geometry("880x700")
         root.minsize(820, 600)
         main = ttk.Frame(root, padding=10)

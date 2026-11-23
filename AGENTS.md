@@ -1,6 +1,6 @@
 # AGENTS.md — TF 卡批量写入工具（tf_flasher）
 
-> 面向下一个开发者/Agent 的项目指南：定位、目录结构、上手、写入流程、编译打包、测试台、平台坑点与已知问题。
+> 面向下一个开发者/Agent 的项目指南：定位、目录结构、上手、写入流程、编译打包、测试台与平台坑点。已知问题清单单独维护在 [SPEC.md](SPEC.md)。
 > 本工具原在「地平线 X3」仓库（提交 `66bddd5` 引入），2026-11-23 迁出为独立项目（X3 侧提交 `d83db3d`），本仓库为唯一维护地。
 
 ## 1. 项目概述
@@ -52,15 +52,15 @@ python tf_flasher.py --flash D:\img\x.img.gz --drives 2,3
 python tf_flasher.py --flash D:\img\x.img.gz --drives 2,3 --no-verify --yes   # 谨慎：跳过确认与读回校验
 ```
 
-写物理盘必须管理员；CLI 非管理员会自动 `ShellExecute runas` 提权重开（frozen 下该路径失效，见 §9）。
+写物理盘必须管理员；CLI 非管理员会自动 `ShellExecute runas` 提权重开（frozen 下该路径失效，见 SPEC.md #5）。
 
 ## 4. 写入流程与安全机制
 
 每个目标盘一个线程，**边解压 gzip 边直写物理盘**，不落临时 `.img`：
 
-1. `lock_volumes()`：对该盘所有本地卷 `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`，句柄保持打开维持锁定（失败只告警，见 §9-4）。
+1. `lock_volumes()`：对该盘所有本地卷 `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`，句柄保持打开维持锁定（失败只告警，见 SPEC.md #4）。
 2. 打开 `\\.\PhysicalDriveN`（`GENERIC_READ|WRITE`，share 必须 READ|WRITE），用 `_RawDiskFile` **直接走 Win32 `WriteFile`/`ReadFile`**（不经 CRT fd 层）。
-3. 8 MiB 块流式写入并同步累计 sha256；末尾不足一扇区时补零（见 §9-1）。
+3. 8 MiB 块流式写入并同步累计 sha256；末尾不足一扇区时补零（补零计入对账是已知缺陷，见 SPEC.md #1）。
 4. `FlushFileBuffers` 落盘。
 5. 与后台预扫描结果对账：字节数 + sha256（缓存命中则秒出）。
 6. 可选读回校验：整段再读一遍算 sha256，比对镜像预期哈希（抓坏块/扩容假卡）。
@@ -98,13 +98,15 @@ python tf_flasher.py --flash D:\img\x.img.gz --drives 2,3 --no-verify --yes   # 
 cd 'E:\devworkspace\TF卡批量写入'
 uv venv .venv --python 3.12              # 或 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install pyinstaller
-pyinstaller --onefile --windowed --uac-admin --clean --name "X3批量写卡" tf_flasher.py
+pip install pyinstaller pillow  # Pillow 仅用于生成图标，应用运行不依赖
+python assets\build_icon.py   # 仅需在重新生成图标时运行
+pyinstaller --onefile --windowed --uac-admin --clean --icon assets\tf_flasher.ico --add-data "assets\tf_flasher.ico;assets" --name "X3批量写卡" tf_flasher.py
 ```
 
 要点：
 
-- `--uac-admin`：exe 启动即管理员，不走代码里的“提权重启”兜底（frozen 下该兜底本身有缺陷，见 §9-5）。
+- `--uac-admin`：exe 启动即管理员，不走代码里的“提权重启”兜底（frozen 下该兜底本身有缺陷，见 SPEC.md #5）。
+- 图标位于 `assets/tf_flasher.ico`（Windows EXE / 窗口）及 `assets/tf_flasher.png`（预览）；也可直接运行 `pyinstaller X3批量写卡.spec`，图标和资源绑定已写入 spec。
 - `--windowed`：无控制台；CLI 子命令在 windowed exe 里看不到输出，回归请用 `--smoke/--list/--image` 看窗口/退出码。
 - onefile 产物在 `dist/`（已被 `.gitignore` 忽略）；缓存/台账落 **exe 旁**（`sys.executable` 目录）。
 - 打包后回归：`dist\X3批量写卡.exe --smoke`、`--list`、`--image <镜像>`（缓存命中应 2s 内出结果）。
@@ -144,23 +146,10 @@ diskpart /s flasher_build\vhd_detach.txt
 - **换行**：`.py` 建议 LF（本仓库未配 `.gitattributes`，Windows 上检出为 CRLF 也能跑）；`.bat` 必须 CRLF。
 - **中文路径**：本工具自身只需普通路径；在 Git Bash 里传 `/` 开头参数要加 `MSYS_NO_PATHCONV=1`。
 
-## 9. 已知问题（2026-11-23 审查，未修）
-
-按影响排序，修前请先补对应 E2E（§7）：
-
-1. **尾部补零计入对账**：`flash_one` 末尾不足一扇区时 `n += len(tail)`、哈希也含补零，非扇区对齐镜像会写完整卡后必报“写入字节数不符/哈希不符”。应改为：补零只写、对账与哈希只覆盖 `img_size`。
-2. **无镜像内容校验**：非 `.gz` 一律按裸 img 写；选错文件（`.zip`/文本/0 字节）会写满卡且“校验通过”（哈希对的是错文件自身）。建议加 gzip 魔数、最小尺寸、MBR/分区表签名检查。
-3. **未排除镜像/工具所在盘**：「全选可写」会把镜像所在 U 盘也选中，写到一半源被擦。应排除镜像路径与进程所在物理盘。
-4. **卷锁定/弹出失败仍继续写**（只 warn）：卷仍挂载时 Windows 脏元数据可能事后回写覆盖新 MBR/分区表，而读回校验已经结束。建议失败即判该目标失败（或加显式 `--force`）。另外只按盘符映射卷，挂载到目录（无盘符）的卷不会被锁定。
-5. **frozen exe 的提权重启失效**：`relaunch_elevated()` 用 `Path(__file__)`，onefile 下指向临时解包目录；目前被 `--uac-admin` 掩盖。
-6. **台账写入未捕获异常**：`write_run_log()` 失败（如 exe 在只读目录）会吞掉完成弹窗；`_finish` 里 `_set_running(False)` 已执行，界面像卡住。
-7. **运行期“读回校验”复选框未禁用**：中途切换后，台账与完成摘要按“当前勾选值”记录，可能与各盘实际执行不一致（错报“校验通过”）。
-8. **`pending` 计数无兜底**：worker 若在 `try` 外抛异常，GUI 会永久停在“写入中”，取消无效。
-9. **CLI/启动器小问题**：`tf_flasher.bat` 未传 `%*`（双击启动器无法走 CLI）；CLI 校验阶段进度因 `printed_mb` 已达上限不再打印。
-
-## 10. 提交前检查
+## 9. 提交前检查
 
 1. `python -m py_compile tf_flasher.py flasher_build\*.py` 全过；
 2. 改写入路径/对账逻辑后跑一遍 §7 的单盘 + 多路 E2E；
 3. `git status` 确认没有镜像（`*.img`/`*.img.gz`）、VHD、`flash_cache/`、`flash_logs/`、exe 被误加；
-4. 文案/标题若改成通用版，同步本文件 §1/§6 的命令与产物名。
+4. 文案/标题若改成通用版，同步本文件 §1/§6 的命令与产物名；
+5. 修掉 SPEC.md 里的条目后，同步更新 SPEC.md 的状态标注。

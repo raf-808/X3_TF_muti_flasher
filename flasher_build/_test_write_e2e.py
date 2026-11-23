@@ -2,7 +2,9 @@
 """临时 E2E 写入测试：对挂载的 64MB 测试 VHD 跑真实 flash_one（写+fsync+读回校验）。
 
 用法: python _test_write_e2e.py [PhysicalDriveIndex]
-不带参数则自动找 bus=15(Msft Virtual Disk) 且 <=128MiB 的磁盘。
+不带参数则只选已登记（mk_vhd_*.py 创建的 %TEMP%\\x3wtest*.vhd）且当前挂载的
+磁盘；显式传入的盘号同样必须通过 vhd_guard 身份核验，否则在调用 flash_one
+之前拒绝退出。
 """
 import gzip
 import hashlib
@@ -13,7 +15,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tf_flasher as t  # noqa: E402
+import vhd_guard  # noqa: E402
 
 TEST = Path(__file__).resolve().parent / "test_img.gz"
 
@@ -33,9 +37,11 @@ def main() -> int:
     idx = int(sys.argv[1]) if len(sys.argv) > 1 else -1
     disks, _ = t.enumerate_disks()
     if idx < 0:
-        cand = [d for d in disks if d["bus"] == 15 and 0 < d["size"] <= (128 << 20)]
-        if not cand:
-            print("未找到测试 VHD（bus=15 且 <=128MiB）。当前盘列表：")
+        try:
+            cand = vhd_guard.select_test_disks(disks)
+        except vhd_guard.VhdGuardError as e:
+            print(f"拒绝自动选盘: {e}")
+            print("当前盘列表：")
             for d in disks:
                 print("  PD%d %s bus=%d" % (d["index"], t._fmt_size(d["size"]), d["bus"]))
             return 2
@@ -44,8 +50,13 @@ def main() -> int:
     if target is None:
         print(f"PhysicalDrive{idx} 不在位")
         return 2
+    try:
+        vhd_path = vhd_guard.ensure_test_disk(idx)
+    except vhd_guard.VhdGuardError as e:
+        print(f"拒绝写入: {e}")
+        return 2
     print(f"目标: PhysicalDrive{idx}  {t._fmt_size(target['size'])}  bus={target['bus']}  "
-          f"sector={target.get('sector')}", flush=True)
+          f"sector={target.get('sector')}  VHD={vhd_path.name}", flush=True)
 
     meta = build_image()
     print(f"测试镜像: {meta['img_size']:,} B  sha256 {meta['img_sha256'][:16]}…", flush=True)

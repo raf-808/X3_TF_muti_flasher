@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""临时 E2E 多路并发写入测试：对所有测试 VHD（bus=15 且 <=128MiB）并行 flash_one。"""
+"""临时 E2E 多路并发写入测试：对所有「已登记且当前挂载」的测试 VHD 并行 flash_one。
+
+候选只来自 vhd_guard 的登记列表（%TEMP%\\x3wtest*.vhd），其他 bus=15 磁盘
+绝不进入候选；映射查询失败或无候选时直接拒绝。
+"""
 import queue
 import sys
 import threading
@@ -8,14 +12,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/
 sys.path.insert(0, str(Path(__file__).resolve().parent))         # flasher_build/
 import tf_flasher as t  # noqa: E402
+import vhd_guard  # noqa: E402
 from _test_write_e2e import build_image  # noqa: E402
 
 
 def main() -> int:
     disks, _ = t.enumerate_disks()
-    targets = [d for d in disks if d["bus"] == 15 and 0 < d["size"] <= (128 << 20)]
-    if not targets:
-        print("未找到测试 VHD")
+    try:
+        targets = vhd_guard.select_test_disks(disks)
+    except vhd_guard.VhdGuardError as e:
+        print(f"拒绝写入: {e}")
         return 2
     meta = build_image()
     meta_box = {"meta": meta, "error": None, "ready": threading.Event()}

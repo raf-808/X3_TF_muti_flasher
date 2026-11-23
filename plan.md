@@ -1,9 +1,9 @@
 # plan.md — TF 卡批量写入：真实缺陷核验与严重问题总调度计划
 
-> 状态：**契约/派工计划已形成，尚未派 subagent、未修改业务代码、未运行物理盘写入测试**。
+> 状态：**S1–S6 已实现并在 `safety-fixes` 分支提交；模拟测试与专用 VHD E2E 全部通过；真实 TF 卡硬件终验待用户执行**。
 > 核对日期：2026-11-23。核对范围：当前磁盘上的 SPEC.md、tf_flasher.py、tf_flasher.bat、flasher_build/_test_write_e2e.py、flasher_build/_test_write_multi.py、AGENTS.md；参考 E:/WebGemini/总调度模式 .md。
 > 本计划只处理已核实的严重风险（P0/P1）及开展安全测试的前置条件。较低严重度单独进入待办，不混入本轮承诺。
-> 原则：**数据不被误擦 > 明确失败 > 正确审计 > 速度与便利性**。所有写盘前置保护必须先于打开 PhysicalDrive 写句柄。
+> 原则：**数据不被误擦 > 明确失败 > 正确审计 > 速度与便利性**。所有写盘前置保护必须先于任何 WriteFile；锁定/弹出失败必须零数据写入。
 
 ## 一、判断尺度与当前核验结论
 
@@ -34,7 +34,7 @@ flasher_build/_test_write_e2e.py 的 main() 接收显式 PhysicalDriveIndex 后�
 
 ### 2.1 必须先明确的业务契约
 
-1. **镜像类型**：默认只支持完整磁盘镜像（裸 .img 或 gzip 封装），接受结构有效的 MBR/GPT；不得仅凭 0x55AA 单一字节判断合法，也不得未经确认就把“所有无 MBR 的合法分区镜像”一概定义为错误。**是否支持分区镜像/无分区表镜像需用户裁决**，未裁决先采用“仅完整磁盘镜像”的安全默认值。
+1. **镜像类型**：默认只支持完整磁盘镜像（裸 .img 或 gzip 封装），接受结构有效的 MBR/GPT；不得仅凭 0x55AA 单一字节判断合法。**用户已裁决（2026-11-23）：仅支持完整磁盘镜像，分区镜像/无分区表镜像一律拒绝**；如需支持，必须另立工作包与新增验收样例。
 2. **镜像门禁**：非法扩展名/魔数不符、空文件、不可解析的分区布局、gzip 截断/校验失败、容量超过目标盘，均应在任何 WriteFile/FSCTL_DISMOUNT_VOLUME 前拒绝；首次完整预扫描可增加等待，但必须有进度、可取消。最小镜像体积阈值及 GPT 保护 MBR 兼容细节在实现前用测试例固定，不拍脑袋设置“统一 1 GiB”之类限制。
 3. **源盘保护**：镜像所在卷对应的所有物理盘、运行 exe/脚本所在卷对应的所有物理盘，不得成为写盘目标；映射失败时默认拒绝写入（fail closed）。考虑盘符、目录挂载点、多 extent 卷和 UNC/网络路径，网络来源不得被误认成本地目标。
 4. **卷保护**：只有完全列举目标盘关联卷，并对全部已挂载卷取得独占锁且成功弹出后才能写；锁失败、弹出失败或枚举结果不可靠则拒写该盘；允许真正无挂载卷的空白卡，但须可验证“枚举完成”。
@@ -46,7 +46,7 @@ flasher_build/_test_write_e2e.py 的 main() 接收显式 PhysicalDriveIndex 后�
 - 本轮为跨物理设备/卷枚举/GUI/CLI 状态链的高影响改动，采用 **Acceptance-First**；不引入额外第三方运行依赖、数据库或不必要的 DDD 分层。
 - 权威边界：**安全的专用 VHD 单盘 + 多路写入与读回**，辅以纯单元/模拟 Win32 测试核验拒写路径；不得用“模拟全绿”代替真实 Windows VHD 终验。
 - 顺序：先捕获修改前 RED（已有静态证据可复用）→ 最小测试 → 修根因 → 聚焦测试 → 受限 VHD 验收。严禁对真卡实施“故意写错文件”等破坏性复现。
-- 当前工作区已经有未提交资产：tf_flasher.py、AGENTS.md、.gitignore 被修改，SPEC.md、assets/ 等未跟踪。**这些是前置基线，不属于任何子代理可领取的变更。**总调度派工前须记录 git status/diff；未获得所有权归属前禁止直接对包含原有脏内容的文件执行整文件 git add/commit。优先经授权使用独立 worktree 和纯净基线；若必须在当前工作区，严格逐 hunk 暂存并核对 staged diff。不得擅自提交用户已有改动。
+- 派工时工作区为干净的 `main`（无未提交改动、无未跟踪文件），不存在需隔离的用户脏改动；按用户裁决新建 `safety-fixes` 分支逐步提交（S3/S4 与 S7 验收修正按 commit 组提交，见第七节）。
 - 禁止将 .img、.img.gz、VHD、flash_cache/、flash_logs/、exe、.venv、.codegraph 等测试/索引产物加入 Git。
 
 ### 2.3 派工文件所有权与交接纪律
@@ -242,11 +242,62 @@ flasher_build/_test_write_e2e.py 的 main() 接收显式 PhysicalDriveIndex 后�
 
 - [x] 已读取总调度模式与项目 AGENTS.md、SPEC.md。
 - [x] 已按当前 tf_flasher.py 逐条核对 SPEC #1–#9 代码调用链。
-- [x] 已安全复现 #2 对非镜像文件的错误接受：python tf_flasher.py --image SPEC.md，返回压缩/解压均 6183 B。
-- [x] 已执行 python -m py_compile tf_flasher.py flasher_build/_test_write_e2e.py flasher_build/_test_write_multi.py，通过。
-- [x] 已发现独立于 SPEC 的 VHD 测试脚本盘号越权风险，并安排 S1 优先封堵。
-- [ ] 用户裁决“是否支持非完整磁盘镜像”及合法输入边界；未决时按仅完整磁盘镜像门禁执行。
-- [ ] 总调度建立可隔离的 Git 基线/工作树，不混入当前用户未提交文件。
-- [ ] S1–S7 尚未派发、尚未编写修复、尚无 VHD/真卡写入验证证据。
+- [x] 已安全复现 #2 对非镜像文件的错误接受（修复前 `--image SPEC.md` 返回 6183 B；修复后退出 2）。
+- [x] 已发现独立于 SPEC 的 VHD 测试脚本盘号越权风险，并完成 S1 护栏。
+- [x] 用户裁决：仅支持完整磁盘镜像；写盘验收采用“模拟 + 总调度发起提权 VHD”；Git 采用新分支逐步提交。
+- [x] Git 基线：派工时 main 干净（无未提交改动），已在 safety-fixes 分支逐步提交。
+- [x] S1–S6 已实现；模拟测试 89 项全绿；专用 VHD E2E（单盘/非对齐/含卷/三路）通过。
+- [ ] 真实 TF 卡/读卡器硬件终验（需用户提供专用测试卡）。
+- [ ] GUI 真实点击流程的独立复验（目前为状态机单测 + `--smoke`，未自动化点击）。
 
 **完成定义**：只有通过“安全拒写 + 真实 VHD 写入校验 + 实际 GUI/CLI 结果一致 + 逐步独立审查 + 合规 Git 提交”的问题，才能在 SPEC.md 标为已修复。
+
+## 七、实施与验收记录（2026-11-23）
+
+### 7.1 提交（safety-fixes 分支，基于 d2b87a8）
+
+| Commit | 内容 |
+|---|---|
+| abcd41e | S1：VHD 测试护栏（登记 VHD → DevicePath → 盘号，fail closed） |
+| 93a6acd | S2：完整卷枚举 + 锁定/弹出失败即拒写 |
+| 5334bfb | S3+S4 commit 组：源盘保护 + 镜像门禁/写前预检 |
+| 6bd5df0 | S5：尾部补零只写不记账，读回只校验原始长度 |
+| 057f66d | S6：verify 启动快照与逐盘校验状态 |
+| 32ac03a | S7 验收修正：offline 写保护、扇区对齐读回、guard DevicePath |
+| 待提交 | SPEC.md / plan.md / AGENTS.md / 验收报告回勾 |
+
+执行方式说明：为避免多个代理并发修改同一个 `tf_flasher.py` 造成冲突，本轮由总调度在
+`safety-fixes` 分支串行实现；S1、S2–S4、S5–S7 分别派只读复核代理（SA-REVIEW）独立审查，
+未并发派发多个写代码代理。
+
+### 7.2 模拟测试结果
+
+- `tests/test_vhd_guard.py`：16 项
+- `tests/test_volume_safety.py`：14 项
+- `tests/test_source_guard.py`：14 项
+- `tests/test_image_preflight.py`：25 项
+- `tests/test_tail_accounting.py`：12 项
+- `tests/test_verify_snapshot.py`：8 项
+
+共 89 项通过；`python -m compileall -q tf_flasher.py flasher_build tests` 通过；`python tf_flasher.py --smoke` 通过；`--image SPEC.md` 退出码 2。
+
+### 7.3 专用 VHD E2E（管理员提权，%TEMP%\x3wtest*.vhd）
+
+- 单盘空白 VHD：16,777,216 B 写入 + 读回校验成功（PD1）。
+- 非对齐尾部：16,777,217 B 写入 + 读回成功（PD1，逻辑 bytes=16,777,217）。
+- 含 NTFS 卷的 VHD（Y:）：锁定/弹出 + offline 后 16MiB 写入 + 读回成功（PD3）。
+- 三路并发：3/3 成功（PD1/PD2/PD3）。
+- 负向：显式传 PhysicalDrive0（系统盘）→ vhd_guard 在 flash_one 前拒绝，脚本退出码 2。
+
+### 7.4 验收中发现并修复的问题
+
+1. 物理盘 `ReadFile` 要求扇区对齐长度：非对齐读回 err=87 → 改为对齐读取、仅原始长度计哈希。
+2. 固定 VHD + 已挂载 NTFS：锁/弹出成功但 ≥1MiB `WriteFile` err=5；磁盘 offline 后可写 → 增加 best-effort offline/online（失败不破坏“锁/弹出失败即拒写”契约）。
+3. `vhd_guard` 用 `Get-Disk` 取盘号依赖管理员 → 改用 `Get-DiskImage.DevicePath`（只读、非管理员可用）。
+
+### 7.5 未验证 / 未修复（不得宣称已完成）
+
+- 真实 TF 卡、真实读卡器、真实容量假卡/坏块卡；需用户提供专用测试卡做硬件终验。
+- GUI 真实点击流程未自动化；仅状态机单测 + `--smoke` 构建自检。
+- SPEC #5 / #6 / #8 / #9 按计划留待后续包；#8 维持加固建议。
+- “含卷 VHD 必须 offline 才能写”是否同样适用于 USB 读卡器未实测；无法 offline 时仍会安全失败/拒写，不会静默损坏。

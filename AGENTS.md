@@ -20,12 +20,14 @@ TF卡批量写入/
 ├── tf_flasher.bat             # 双击启动器：自动挑一个带 tkinter 的解释器（机器相关路径，见文件头注释）
 ├── .gitignore                 # 缓存/台账/exe/测试产物/本地镜像不入库
 ├── flasher_build/             # 写入 E2E 测试台（VHD 当"物理盘"，安全无风险）
-│   ├── _test_write_e2e.py     # 单盘：造 16MiB 确定性镜像 → 真 flash_one 写+fsync+读回校验
-│   ├── _test_write_multi.py   # 多路：对所有测试 VHD 并发 flash_one（3 路已验证）
+│   ├── vhd_guard.py           # E2E 护栏：目标盘必须是已登记且挂载的测试 VHD，否则拒绝
+│   ├── _test_write_e2e.py     # 单盘：造合法 MBR 镜像 → 真 flash_one 写+fsync+读回校验（--tail 非对齐）
+│   ├── _test_write_multi.py   # 多路：对登记测试 VHD 并发 flash_one（3 路已验证）
 │   ├── mk_vhd_script.py       # 生成 vhd.txt（diskpart：建 64MB 固定 VHD 并挂载）
 │   ├── mk_vhd_more.py         # 生成 vhd3.txt（再建/挂 2 个测试 VHD）
 │   ├── mk_vhd_letter.py       # 生成 vhd2.txt（给测试 VHD 分区并分配盘符 X:）
 │   └── detach_vhd.py          # 生成 vhd_detach.txt（卸载 3 个测试 VHD）
+├── tests/                     # 纯模拟单测（不写盘）：VHD 护栏/卷安全/源盘/镜像门禁/尾部对账/verify
 ├── flash_cache/               # 本地：镜像预扫描缓存（按 gz 的 sha256 内容寻址，git 忽略）
 ├── flash_logs/                # 本地：每次写入运行的 JSON 台账（git 忽略）
 └── flasher_dist/              # 本地：PyInstaller 输出（git 忽略）
@@ -56,14 +58,15 @@ python tf_flasher.py --flash D:\img\x.img.gz --drives 2,3 --no-verify --yes   # 
 
 ## 4. 写入流程与安全机制
 
-每个目标盘一个线程，**边解压 gzip 边直写物理盘**，不落临时 `.img`：
+每个目标盘一个线程，**先完整预检镜像，通过后才边解压 gzip 边直写物理盘**，不落临时 `.img`：
 
-1. `lock_volumes()`：对该盘所有本地卷 `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`，句柄保持打开维持锁定（失败只告警，见 SPEC.md #4）。
-2. 打开 `\\.\PhysicalDriveN`（`GENERIC_READ|WRITE`，share 必须 READ|WRITE），用 `_RawDiskFile` **直接走 Win32 `WriteFile`/`ReadFile`**（不经 CRT fd 层）。
-3. 8 MiB 块流式写入并同步累计 sha256；末尾不足一扇区时补零（补零计入对账是已知缺陷，见 SPEC.md #1）。
+0. 写盘前预检：gzip 魔数/CRC、解压大小/sha256、MBR 或 GPT 整盘结构；GUI 预检失败不启动写线程，CLI 直接非 0 退出。
+1. 完整枚举目标盘所有本地卷（`FindFirstVolume`，含无盘符/目录挂载/多 extent），逐个 `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME`，句柄保持打开；任一失败该盘拒写（SPEC.md #4）。
+2. 打开 `\\.\PhysicalDriveN`（`GENERIC_READ|WRITE`，share 必须 READ|WRITE），随后 best-effort 置磁盘 offline 解除 Windows 对已挂载卷 extent 的写保护；写后恢复 online。用 `_RawDiskFile` **直接走 Win32 `WriteFile`/`ReadFile`**（不经 CRT fd 层）。
+3. 8 MiB 块流式写入并同步累计 sha256；末尾不足一扇区时补零**只写设备**，不计入逻辑字节/哈希（SPEC.md #1 已修）。
 4. `FlushFileBuffers` 落盘。
-5. 与后台预扫描结果对账：字节数 + sha256（缓存命中则秒出）。
-6. 可选读回校验：整段再读一遍算 sha256，比对镜像预期哈希（抓坏块/扩容假卡）。
+5. 与预扫描结果对账：逻辑字节数 + sha256（缓存命中则秒出）。
+6. 可选读回校验：只读回原始镜像长度（按扇区对齐读取）并比对哈希，抓坏块/扩容假卡；verify 在启动时冻结，逐盘记录 `verify_requested/verify_completed`。
 
 内置防护：
 
@@ -71,9 +74,12 @@ python tf_flasher.py --flash D:\img\x.img.gz --drives 2,3 --no-verify --yes   # 
 |---|---|
 | 目标判定 | 可移除介质（属性位 / 几何 MediaType / SD/MMC 总线三选一）+ 非系统盘 + 容量 ≤ 64 GiB |
 | 大磁盘保护 | > 64 GiB 的盘不枚举为写卡目标（防误选大硬盘） |
+| 镜像门禁 | 仅整盘 MBR/GPT；空文件/文本/zip/伪 gzip/CRC 错误/分区越界写前拒绝 |
+| 源盘保护 | 镜像与程序所在物理盘禁写（UNC/网络路径除外）；卷映射失败即拒写 |
+| 卷安全 | 所有关联卷锁定+弹出失败即拒写；枚举失败不当“空盘”；空白盘允许写 |
 | 二次确认 | 明列每个目标的盘号/容量/总线/型号/盘符 |
-| 容量保护 | 已知镜像大小时，卡过小直接拒绝；未知时写入中途报错兜底 |
-| 台账 | 每次运行落 `flash_logs/flash_<时间戳>.json`（目标、哈希、速度、结果） |
+| 容量保护 | 预检解压大小 > 目标容量时 GUI/CLI 零写入 |
+| 台账 | 每次运行落 `flash_logs/flash_<时间戳>.json`（目标、哈希、速度、逐盘校验状态、结果） |
 
 写完提醒：Windows 若弹「使用驱动器前需要格式化」**一律点取消**——那是卡的 ext4 分区，Windows 不认识。
 
@@ -121,8 +127,11 @@ pyinstaller --onefile --windowed --uac-admin --clean --icon assets\tf_flasher.ic
 python flasher_build\mk_vhd_script.py
 diskpart /s flasher_build\vhd.txt
 
-# 2) 单盘 E2E：自动找 bus=15 且 ≤128MiB 的盘（也可显式传 PhysicalDriveN 的 N）
+# 2) 单盘 E2E：只选已登记且当前挂载的测试 VHD（%TEMP%\x3wtest*.vhd）；
+#    vhd_guard 做身份核验，显式传 PhysicalDriveN 也必须映射到登记 VHD，否则写前拒绝。
+#    --tail 生成 16MiB+1 非对齐镜像，验证尾部补零只写不记账。
 python flasher_build\_test_write_e2e.py
+python flasher_build\_test_write_e2e.py --tail
 
 # 3) 多路并发：再建 2 个测试 VHD 后跑
 python flasher_build\mk_vhd_more.py
@@ -148,8 +157,9 @@ diskpart /s flasher_build\vhd_detach.txt
 
 ## 9. 提交前检查
 
-1. `python -m py_compile tf_flasher.py flasher_build\*.py` 全过；
-2. 改写入路径/对账逻辑后跑一遍 §7 的单盘 + 多路 E2E；
-3. `git status` 确认没有镜像（`*.img`/`*.img.gz`）、VHD、`flash_cache/`、`flash_logs/`、exe 被误加；
-4. 文案/标题若改成通用版，同步本文件 §1/§6 的命令与产物名；
-5. 修掉 SPEC.md 里的条目后，同步更新 SPEC.md 的状态标注。
+1. `python -m compileall -q tf_flasher.py flasher_build tests` 全过；
+2. 纯模拟单测（不写盘）：`python tests\test_vhd_guard.py`、`test_volume_safety.py`、`test_source_guard.py`、`test_image_preflight.py`、`test_tail_accounting.py`、`test_verify_snapshot.py`；
+3. 改写入路径/对账逻辑后跑一遍 §7 的单盘 + 多路 E2E（E2E 已限制为登记 VHD）；
+4. `git status` 确认没有镜像（`*.img`/`*.img.gz`）、VHD、`flash_cache/`、`flash_logs/`、exe 被误加；
+5. 文案/标题若改成通用版，同步本文件 §1/§6 的命令与产物名；
+6. 修掉 SPEC.md 里的条目后，同步更新 SPEC.md 的状态标注。

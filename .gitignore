@@ -1,0 +1,19 @@
+# 写卡工具本地产物（镜像预扫描缓存 + 写入台账 + exe 打包输出）
+flash_cache/
+flash_logs/
+flasher_dist/
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+flasher_build/venv/
+
+# 测试台产物（diskpart 脚本 / 临时测试镜像 / VHD）
+flasher_build/*.txt
+flasher_build/test_img.gz
+*.vhd
+
+# 本地镜像（GB 级不入库，哈希以发布方校验清单为准）
+*.img
+*.img.gz
